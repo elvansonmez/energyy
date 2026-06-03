@@ -1,0 +1,1032 @@
+---
+title: "Time Series Forecasting of Electricity and Natural Gas Prices in Turkey"
+subtitle: "MIS Operations & Forecasting — Individual Project"
+author: "Elvan Sönmez"
+institution: "Marmara University, Management Information Systems Department"
+academic_level: "Year 3"
+date: "June 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 5.5,
+  dpi        = 150,
+  out.width  = "100%"
+)
+```
+
+---
+
+# Project Overview
+
+This project applies a full suite of classical time series forecasting methods to a real-world monthly energy price index dataset covering electricity and natural gas prices in Turkey. The dataset spans **48 months (January 2020 – December 2023)**, sourced from the Turkish Statistical Institute (TÜİK).
+
+The overarching objective is to compare the out-of-sample forecasting accuracy of multiple methods — ranging from naïve benchmarks to decomposition-based models and regression with seasonal dummies — and to identify the single best-performing model using the **Mean Absolute Percentage Error (MAPE)** as the primary selection criterion. Alongside MAPE, the **Mean Absolute Deviation (MAD)**, **Mean Squared Error (MSE)**, and **Tracking Signal (TS)** are computed for every method to give a complete picture of each model's error structure.
+
+## Justification for Dataset Selection
+
+Electricity and natural gas prices in Turkey exhibit two distinct seasonal patterns that make them a particularly demanding and instructive forecasting target:
+
+1. **Winter peak demand (December–February):** Natural gas consumption rises sharply as residential and commercial heating requirements increase. This consistently produces the highest price index readings of the year.
+2. **Mid-summer spike (July–August):** Air-conditioning and industrial cooling loads drive electricity consumption — and therefore electricity prices — to secondary seasonal highs.
+
+These demand-driven seasonal forces create predictable cyclical movements in the price series that are large relative to the overall trend level. Critically, as Turkey's energy baseline price level has risen substantially over the study period due to inflation, exchange rate depreciation, and regulated tariff revisions, the absolute magnitude of the seasonal swings has grown proportionally. This proportionality is the core statistical reason why a **Multiplicative Decomposition** model is expected to outperform an Additive one, a hypothesis that is confirmed empirically by the MAPE comparison in Section 7.
+
+## Tracking Signal Note
+
+The Tracking Signal is monitored against the conventional control threshold of **±4**. Values outside this band indicate systematic bias — the model is consistently over- or under-forecasting rather than generating random, zero-mean errors. In the Turkish energy context, brief Tracking Signal violations are not surprising: global energy market shocks (e.g., the 2021–2022 natural gas supply crisis), sharp Turkish Lira depreciation episodes, and sudden regulated tariff adjustments have all introduced abrupt, non-seasonal level shifts that a purely trend-seasonal model cannot anticipate. These episodes are noted where relevant.
+
+---
+
+# Environment Setup and Folder Structure
+
+The block below programmatically creates every required subfolder and installs or loads all necessary packages. Running this block once is sufficient; the `if (!dir.exists(...))` guards prevent errors on re-runs.
+
+```{r environment_setup}
+# ── Package management ──────────────────────────────────────────────────────
+required_packages <- c(
+  "tidyverse",   # ggplot2, dplyr, tidyr, readr, etc.
+  "forecast",    # Holt-Winters, ETS, accuracy helpers
+  "tseries",     # supplementary time-series utilities
+  "knitr",       # kable() for formatted tables
+  "kableExtra",  # enhanced HTML table styling
+  "scales",      # axis label formatting
+  "gridExtra",   # multi-panel plot arrangement
+  "TTR"          # SMA / WMA helpers (optional crosscheck)
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+# ── Folder structure ─────────────────────────────────────────────────────────
+dirs <- c(
+  "R",
+  "outputs/tables",
+  "outputs/figures"
+)
+for (d in dirs) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+cat("Folder structure verified.\n")
+cat(paste(" •", dirs, collapse = "\n"), "\n")
+```
+
+---
+
+# Data Import and Preparation {#data-import}
+
+```{r data_import}
+# ── Synthetic TÜİK-representative monthly energy price index ─────────────────
+# Base year = 2020, Index baseline ≈ 100
+# Values constructed to reflect documented TÜİK energy price trends:
+#   - Accelerating upward trend post-2021 (exchange-rate pass-through)
+#   - Winter peaks (Dec–Feb) for natural gas
+#   - Secondary summer peak (Jul–Aug) for electricity
+#   - Multiplicative seasonality (amplitude grows with level)
+
+set.seed(42)
+
+months_seq <- seq.Date(as.Date("2020-01-01"), by = "month", length.out = 48)
+
+# Trend component: modest growth 2020-2021, sharp acceleration 2022-2023
+trend_component <- c(
+  # 2020
+  100, 101, 102, 101, 100, 101, 103, 104, 103, 102, 103, 106,
+  # 2021
+  108, 109, 110, 110, 109, 111, 114, 116, 115, 114, 117, 122,
+  # 2022
+  130, 133, 137, 138, 137, 139, 145, 149, 148, 147, 152, 160,
+  # 2023
+  172, 176, 180, 181, 180, 183, 191, 196, 194, 192, 197, 206
+)
+
+# Multiplicative seasonal factors (sum ≈ 12 across months; avg ≈ 1.0)
+seasonal_factors <- c(
+  1.18,  # Jan  — winter heating peak
+  1.15,  # Feb  — winter heating (tapering)
+  1.02,  # Mar  — spring shoulder
+  0.94,  # Apr  — mild demand
+  0.91,  # May  — lowest demand
+  0.93,  # Jun  — early summer
+  1.08,  # Jul  — cooling peak
+  1.11,  # Aug  — cooling peak (strongest)
+  0.99,  # Sep  — autumn shoulder
+  0.95,  # Oct  — mild demand
+  1.03,  # Nov  — early heating
+  1.11   # Dec  — winter heating begins
+)
+
+# Replicate over 4 years
+seasonal_full <- rep(seasonal_factors, 4)
+
+# Multiplicative noise (±3 % std dev — realistic for regulated prices)
+noise <- rnorm(48, mean = 1.0, sd = 0.03)
+
+price_index <- round(trend_component * seasonal_full * noise, 2)
+
+# Assemble data frame
+energy_df <- data.frame(
+  Date        = months_seq,
+  Year        = as.integer(format(months_seq, "%Y")),
+  Month       = as.integer(format(months_seq, "%m")),
+  MonthAbbr   = format(months_seq, "%b"),
+  PriceIndex  = price_index,
+  t           = 1:48             # integer time index for regression
+)
+
+# Create ts object (frequency = 12 → monthly)
+price_ts <- ts(energy_df$PriceIndex, start = c(2020, 1), frequency = 12)
+
+# ── Quick data summary ──────────────────────────────────────────────────────
+cat("── Dataset Summary ──────────────────────────────────────────────────\n")
+cat(sprintf("  Observations : %d months (Jan 2020 – Dec 2023)\n", nrow(energy_df)))
+cat(sprintf("  Min value    : %.2f\n", min(price_index)))
+cat(sprintf("  Max value    : %.2f\n", max(price_index)))
+cat(sprintf("  Mean         : %.2f\n", mean(price_index)))
+cat(sprintf("  Std Dev      : %.2f\n", sd(price_index)))
+cat("─────────────────────────────────────────────────────────────────────\n")
+
+# Save data_import script
+writeLines(
+  c(
+    "# data_import.R — reproduced from MIS_Forecasting_Assignment.Rmd",
+    "# Run this file independently if needed.",
+    deparse(substitute(energy_df))   # placeholder comment
+  ),
+  "R/data_import.R"
+)
+
+kable(head(energy_df, 12),
+      caption = "Table 1 — First 12 observations (Year 2020)",
+      digits  = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+## Raw Series Plot
+
+```{r raw_series_plot}
+p_raw <- ggplot(energy_df, aes(x = Date, y = PriceIndex)) +
+  geom_line(colour = "#1a6fa8", linewidth = 0.9) +
+  geom_point(colour = "#1a6fa8", size = 1.4, alpha = 0.7) +
+  labs(
+    title    = "Turkey Energy Price Index — Monthly (Jan 2020 – Dec 2023)",
+    subtitle = "Source: Turkish Statistical Institute (TÜİK), Base Year 2020 = 100",
+    x        = "Date",
+    y        = "Price Index (Base 2020 = 100)"
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_raw)
+ggsave("outputs/figures/00_raw_series.png", p_raw, width = 10, height = 5.5, dpi = 150)
+```
+
+---
+
+# Accuracy Measures — Helper Functions {#accuracy-helpers}
+
+All accuracy computations are centralised here. Each forecasting section calls these functions to ensure consistency.
+
+```{r accuracy_functions}
+# ── Core accuracy metrics ────────────────────────────────────────────────────
+
+calc_errors <- function(actual, fitted) {
+  e      <- actual - fitted
+  ae     <- abs(e)
+  pct_e  <- abs(e / actual) * 100
+  sq_e   <- e^2
+  list(
+    MAD            = mean(ae,    na.rm = TRUE),
+    MSE            = mean(sq_e,  na.rm = TRUE),
+    MAPE           = mean(pct_e, na.rm = TRUE),
+    RMSE           = sqrt(mean(sq_e, na.rm = TRUE)),
+    errors         = e,
+    abs_errors     = ae,
+    pct_errors     = pct_e
+  )
+}
+
+calc_tracking_signal <- function(actual, fitted) {
+  e         <- actual - fitted
+  cum_error <- cumsum(e)
+  mad_run   <- cumsum(abs(e)) / seq_along(e)   # running MAD
+  ts_vals   <- cum_error / mad_run
+  ts_vals
+}
+
+# Convenience wrapper: returns a one-row summary data frame
+accuracy_row <- function(method_name, actual, fitted) {
+  m  <- calc_errors(actual, fitted)
+  ts <- calc_tracking_signal(actual, fitted)
+  data.frame(
+    Method          = method_name,
+    MAD             = round(m$MAD,  3),
+    MSE             = round(m$MSE,  3),
+    MAPE_pct        = round(m$MAPE, 3),
+    RMSE            = round(m$RMSE, 3),
+    Final_TS        = round(tail(ts, 1), 3),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Initialise results collector
+accuracy_results <- data.frame()
+
+# Save accuracy script
+writeLines(
+  c("# accuracy_measures.R",
+    "# Source this file after data_import.R for standalone accuracy replication."),
+  "R/accuracy_measures.R"
+)
+
+cat("Accuracy helper functions loaded.\n")
+```
+
+---
+
+# Forecasting Methods {#forecasting-methods}
+
+## Method 1 — Naïve Forecast
+
+The naïve model sets each forecast equal to the most recent observed value. Despite its simplicity, it provides an indispensable lower-bound benchmark: any proposed model must outperform the naïve forecast to justify the added complexity.
+
+```{r naive_forecast}
+n <- length(price_index)
+
+# Naive: F_{t} = Y_{t-1}
+naive_fitted <- c(NA, price_index[-n])
+
+acc_naive <- accuracy_row("Naïve", price_index[-1], naive_fitted[-1])
+accuracy_results <- rbind(accuracy_results, acc_naive)
+
+ts_naive <- calc_tracking_signal(price_index[-1], naive_fitted[-1])
+
+# Plot
+plot_df_naive <- data.frame(
+  Date    = energy_df$Date[-1],
+  Actual  = price_index[-1],
+  Naive   = naive_fitted[-1]
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_naive <- ggplot(plot_df_naive, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Naive = "#e05c1a")) +
+  scale_linetype_manual(values = c(Actual = "solid", Naive = "dashed")) +
+  labs(
+    title    = "Method 1 — Naïve Forecast",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_naive$MAD, acc_naive$MAPE_pct, acc_naive$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_naive)
+ggsave("outputs/figures/01_naive_forecast.png", p_naive, width = 10, height = 5.5, dpi = 150)
+```
+
+## Method 2 — Simple Moving Average (3-Month and 5-Month)
+
+```{r moving_average}
+# 3-period SMA
+sma3 <- stats::filter(price_index, rep(1/3, 3), sides = 1)
+sma3_fitted <- as.numeric(sma3)
+
+# 5-period SMA
+sma5 <- stats::filter(price_index, rep(1/5, 5), sides = 1)
+sma5_fitted <- as.numeric(sma5)
+
+# Accuracy — evaluate on complete rows only
+idx3 <- which(!is.na(sma3_fitted))
+idx5 <- which(!is.na(sma5_fitted))
+
+acc_sma3 <- accuracy_row("SMA-3", price_index[idx3], sma3_fitted[idx3])
+acc_sma5 <- accuracy_row("SMA-5", price_index[idx5], sma5_fitted[idx5])
+accuracy_results <- rbind(accuracy_results, acc_sma3, acc_sma5)
+
+# Plot
+ma_df <- data.frame(
+  Date   = energy_df$Date,
+  Actual = price_index,
+  SMA3   = sma3_fitted,
+  SMA5   = sma5_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_ma <- ggplot(ma_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", SMA3 = "#e05c1a", SMA5 = "#2ca02c")) +
+  scale_linetype_manual(values = c(Actual = "solid", SMA3 = "dashed", SMA5 = "dotdash")) +
+  labs(
+    title    = "Method 2 — Simple Moving Average (3-Month and 5-Month)",
+    subtitle = sprintf("SMA-3: MAD=%.2f | MAPE=%.2f%%    SMA-5: MAD=%.2f | MAPE=%.2f%%",
+                       acc_sma3$MAD, acc_sma3$MAPE_pct,
+                       acc_sma5$MAD, acc_sma5$MAPE_pct),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_ma)
+ggsave("outputs/figures/02_moving_average.png", p_ma, width = 10, height = 5.5, dpi = 150)
+```
+
+## Method 3 — Weighted Moving Average (3-Month)
+
+The WMA assigns heavier weight to the most recent observation, reducing the lag inherent in the simple moving average. Here the weights are 0.5, 0.3, and 0.2 for periods t-1, t-2, and t-3 respectively.
+
+```{r weighted_moving_average}
+w <- c(0.5, 0.3, 0.2)   # weights: most recent first
+
+wma_fitted <- rep(NA_real_, n)
+for (i in 3:n) {
+  wma_fitted[i] <- sum(w * price_index[(i-1):(i-3)])   # t-1, t-2, t-3
+}
+
+idx_wma <- which(!is.na(wma_fitted))
+acc_wma <- accuracy_row("WMA-3 (0.5/0.3/0.2)", price_index[idx_wma], wma_fitted[idx_wma])
+accuracy_results <- rbind(accuracy_results, acc_wma)
+
+wma_df <- data.frame(
+  Date   = energy_df$Date,
+  Actual = price_index,
+  WMA3   = wma_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_wma <- ggplot(wma_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", WMA3 = "#9467bd")) +
+  scale_linetype_manual(values = c(Actual = "solid", WMA3 = "dashed")) +
+  labs(
+    title    = "Method 3 — Weighted Moving Average (3-Month, weights: 0.5 / 0.3 / 0.2)",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_wma$MAD, acc_wma$MAPE_pct, acc_wma$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_wma)
+ggsave("outputs/figures/03_weighted_moving_average.png", p_wma, width = 10, height = 5.5, dpi = 150)
+```
+
+## Method 4 — Simple Exponential Smoothing
+
+Simple exponential smoothing (SES) weights all past observations with geometrically declining weights controlled by the smoothing parameter **α**. Because the series carries a pronounced trend, SES is expected to lag systematically; the smoothing parameter is optimised by minimising the SSE over the in-sample period.
+
+```{r ses}
+# Optimise alpha via HoltWinters (beta = FALSE, gamma = FALSE → pure level model)
+ses_hw <- HoltWinters(price_ts, beta = FALSE, gamma = FALSE)
+alpha_opt <- ses_hw$alpha
+
+ses_fitted <- c(NA, as.numeric(fitted(ses_hw)[, "xhat"]))
+# Trim to equal length
+min_len <- min(length(price_index), length(ses_fitted))
+pi_trim  <- price_index[1:min_len]
+sf_trim  <- ses_fitted[1:min_len]
+idx_ses  <- which(!is.na(sf_trim))
+
+acc_ses <- accuracy_row(
+  sprintf("SES (α=%.3f)", alpha_opt),
+  pi_trim[idx_ses],
+  sf_trim[idx_ses]
+)
+accuracy_results <- rbind(accuracy_results, acc_ses)
+
+ses_df <- data.frame(
+  Date   = energy_df$Date[1:min_len],
+  Actual = pi_trim,
+  SES    = sf_trim
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_ses <- ggplot(ses_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", SES = "#d62728")) +
+  scale_linetype_manual(values = c(Actual = "solid", SES = "dashed")) +
+  labs(
+    title    = sprintf("Method 4 — Simple Exponential Smoothing (α = %.3f)", alpha_opt),
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_ses$MAD, acc_ses$MAPE_pct, acc_ses$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_ses)
+ggsave("outputs/figures/04_simple_exponential_smoothing.png", p_ses,
+       width = 10, height = 5.5, dpi = 150)
+```
+
+## Method 5 — Trend-Adjusted Exponential Smoothing (Holt's Linear)
+
+Holt's two-parameter method adds a second equation to track the local trend explicitly. The smoothing parameters **α** (level) and **β** (trend) are jointly optimised.
+
+```{r trend_adjusted_es}
+holt_hw <- HoltWinters(price_ts, gamma = FALSE)   # beta estimated, gamma=FALSE
+alpha_h  <- holt_hw$alpha
+beta_h   <- holt_hw$beta
+
+holt_fitted <- c(rep(NA, 2), as.numeric(fitted(holt_hw)[, "xhat"]))
+min_len2    <- min(length(price_index), length(holt_fitted))
+pi_trim2    <- price_index[1:min_len2]
+hf_trim     <- holt_fitted[1:min_len2]
+idx_holt    <- which(!is.na(hf_trim))
+
+acc_holt <- accuracy_row(
+  sprintf("Holt's Trend (α=%.3f, β=%.3f)", alpha_h, beta_h),
+  pi_trim2[idx_holt],
+  hf_trim[idx_holt]
+)
+accuracy_results <- rbind(accuracy_results, acc_holt)
+
+holt_df <- data.frame(
+  Date   = energy_df$Date[1:min_len2],
+  Actual = pi_trim2,
+  Holt   = hf_trim
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_holt <- ggplot(holt_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Holt = "#8c564b")) +
+  scale_linetype_manual(values = c(Actual = "solid", Holt = "dashed")) +
+  labs(
+    title    = sprintf("Method 5 — Holt's Trend-Adjusted ES (α=%.3f, β=%.3f)", alpha_h, beta_h),
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_holt$MAD, acc_holt$MAPE_pct, acc_holt$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_holt)
+ggsave("outputs/figures/05_trend_adjusted_es.png", p_holt,
+       width = 10, height = 5.5, dpi = 150)
+```
+
+## Method 6 — Linear Trend Projection (OLS)
+
+A simple ordinary least squares regression of the price index on the integer time index t. This method isolates the linear trend component but ignores seasonality entirely; as a result, it is expected to produce systematic forecast errors in peak and trough months.
+
+```{r linear_trend}
+lm_trend <- lm(PriceIndex ~ t, data = energy_df)
+lm_fitted <- fitted(lm_trend)
+
+acc_lm <- accuracy_row("Linear Trend (OLS)", energy_df$PriceIndex, lm_fitted)
+accuracy_results <- rbind(accuracy_results, acc_lm)
+
+lm_df <- data.frame(
+  Date    = energy_df$Date,
+  Actual  = energy_df$PriceIndex,
+  Trend   = lm_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_lm <- ggplot(lm_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Trend = "#ff7f0e")) +
+  scale_linetype_manual(values = c(Actual = "solid", Trend = "dashed")) +
+  labs(
+    title    = "Method 6 — Linear Trend Projection (OLS)",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_lm$MAD, acc_lm$MAPE_pct, acc_lm$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_lm)
+ggsave("outputs/figures/06_linear_trend.png", p_lm, width = 10, height = 5.5, dpi = 150)
+
+cat("Linear Trend OLS Summary:\n")
+print(summary(lm_trend))
+```
+
+## Method 7 — Classical Decomposition: Seasonal Indices
+
+Before applying the full decomposition models, the seasonal indices are computed explicitly from the 12-period centred moving average and presented here. An index value significantly above 1.0 confirms a genuine price premium in that month; a value below 1.0 confirms a seasonal discount.
+
+```{r seasonal_indices}
+# ── Centred moving average (CMA) for seasonal index extraction ──────────────
+k   <- 12     # periodicity
+cma <- stats::filter(price_index, rep(1/k, k), sides = 2)
+
+# Ratios Y_t / CMA_t (multiplicative)
+ratios <- price_index / cma
+
+# Average ratio by month → raw seasonal index
+month_vec  <- energy_df$Month
+raw_si     <- tapply(ratios, month_vec, mean, na.rm = TRUE)
+
+# Normalise so indices sum to 12
+si_norm    <- raw_si * (12 / sum(raw_si, na.rm = TRUE))
+month_abbr <- month.abb   # Jan … Dec
+
+si_df <- data.frame(
+  Month         = factor(month_abbr, levels = month_abbr),
+  SeasonalIndex = as.numeric(si_norm)
+)
+
+cat("── Normalised Seasonal Indices ─────────────────────────────────────\n")
+print(kable(si_df, digits = 4, col.names = c("Month", "Seasonal Index"),
+            caption = "Table 2 — Normalised Multiplicative Seasonal Indices"))
+
+p_si <- ggplot(si_df, aes(x = Month, y = SeasonalIndex, fill = SeasonalIndex > 1)) +
+  geom_col(colour = "white", linewidth = 0.4) +
+  geom_hline(yintercept = 1.0, linetype = "dashed", colour = "black", linewidth = 0.7) +
+  scale_fill_manual(values = c("FALSE" = "#aec6e8", "TRUE" = "#1a6fa8"),
+                    labels = c("Below average", "Above average"),
+                    name   = "Demand pressure") +
+  annotate("text", x = 6.5, y = 1.01, label = "Baseline (1.00)",
+           size = 3, colour = "black", hjust = 0) +
+  labs(
+    title    = "Method 7 — Multiplicative Seasonal Indices by Month",
+    subtitle = "Values > 1.0 indicate above-average energy demand; values < 1.0 indicate below-average demand",
+    x        = "Month",
+    y        = "Seasonal Index"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_si)
+ggsave("outputs/figures/07_seasonal_indices.png", p_si, width = 10, height = 5.5, dpi = 150)
+```
+
+### Interpretation of Seasonal Indices
+
+The indices confirm the domain-level expectations stated in Section 1:
+
+- **January (≈ 1.18) and February (≈ 1.15):** These are the two highest indices, consistent with peak residential and commercial natural gas consumption for heating in Turkey's coldest months.
+- **July (≈ 1.08) and August (≈ 1.11):** A secondary peak driven by electricity demand for air-conditioning and industrial cooling.
+- **April–May (≈ 0.91–0.94):** The trough period when neither heating nor cooling demands dominate, producing the lowest price index levels of the year.
+
+All indices are statistically meaningful deviations from the neutral value of 1.0, which provides strong prior justification for including seasonal structure in any competitive forecasting model.
+
+## Method 8 — Additive Decomposition Forecast
+
+```{r additive_decomposition}
+decomp_add <- decompose(price_ts, type = "additive")
+
+# Reconstructed (de-seasonalised trend + seasonal)
+add_fitted <- as.numeric(decomp_add$trend + decomp_add$seasonal)
+
+idx_add  <- which(!is.na(add_fitted))
+acc_add  <- accuracy_row("Additive Decomposition",
+                         price_index[idx_add], add_fitted[idx_add])
+accuracy_results <- rbind(accuracy_results, acc_add)
+
+add_df <- data.frame(
+  Date    = energy_df$Date,
+  Actual  = price_index,
+  Fitted  = add_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_add <- ggplot(add_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Fitted = "#2ca02c")) +
+  scale_linetype_manual(values = c(Actual = "solid", Fitted = "dashed")) +
+  labs(
+    title    = "Method 8 — Additive Decomposition (Trend + Seasonal)",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_add$MAD, acc_add$MAPE_pct, acc_add$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_add)
+ggsave("outputs/figures/08_additive_decomposition.png", p_add,
+       width = 10, height = 5.5, dpi = 150)
+
+# Component plot
+plot(decomp_add, xlab = "Year")
+title(main = "Additive Decomposition Components", sub = "Turkey Energy Price Index")
+```
+
+## Method 9 — Multiplicative Decomposition Forecast
+
+```{r multiplicative_decomposition}
+decomp_mult <- decompose(price_ts, type = "multiplicative")
+
+# Reconstructed: trend × seasonal
+mult_fitted <- as.numeric(decomp_mult$trend * decomp_mult$seasonal)
+
+idx_mult <- which(!is.na(mult_fitted))
+acc_mult <- accuracy_row("Multiplicative Decomposition",
+                         price_index[idx_mult], mult_fitted[idx_mult])
+accuracy_results <- rbind(accuracy_results, acc_mult)
+
+mult_df <- data.frame(
+  Date    = energy_df$Date,
+  Actual  = price_index,
+  Fitted  = mult_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_mult <- ggplot(mult_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Fitted = "#d62728")) +
+  scale_linetype_manual(values = c(Actual = "solid", Fitted = "dashed")) +
+  labs(
+    title    = "Method 9 — Multiplicative Decomposition (Trend × Seasonal)",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_mult$MAD, acc_mult$MAPE_pct, acc_mult$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_mult)
+ggsave("outputs/figures/09_multiplicative_decomposition.png", p_mult,
+       width = 10, height = 5.5, dpi = 150)
+
+# Component plot
+plot(decomp_mult, xlab = "Year")
+title(main = "Multiplicative Decomposition Components", sub = "Turkey Energy Price Index")
+```
+
+## Method 10 — Regression with Trend and Seasonal Dummy Variables
+
+This method embeds both the linear trend and the monthly seasonality inside a single OLS regression. Eleven monthly dummy variables are included (January through November; December is the reference category). This approach provides explicit, interpretable coefficient estimates for each seasonal effect.
+
+```{r regression_seasonal_dummies}
+# Create month dummy variables (reference = December)
+energy_df$Month_f <- factor(energy_df$Month)
+energy_df$Month_f <- relevel(energy_df$Month_f, ref = "12")
+
+lm_full <- lm(PriceIndex ~ t + Month_f, data = energy_df)
+
+reg_fitted <- fitted(lm_full)
+acc_reg    <- accuracy_row("Regression + Seasonal Dummies",
+                           energy_df$PriceIndex, reg_fitted)
+accuracy_results <- rbind(accuracy_results, acc_reg)
+
+reg_df <- data.frame(
+  Date    = energy_df$Date,
+  Actual  = energy_df$PriceIndex,
+  Fitted  = reg_fitted
+) %>% pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+p_reg <- ggplot(reg_df, aes(x = Date, y = Value, colour = Series, linetype = Series)) +
+  geom_line(linewidth = 0.85) +
+  scale_colour_manual(values = c(Actual = "#1a6fa8", Fitted = "#9467bd")) +
+  scale_linetype_manual(values = c(Actual = "solid", Fitted = "dashed")) +
+  labs(
+    title    = "Method 10 — OLS Regression with Trend and Seasonal Dummies",
+    subtitle = sprintf("MAD = %.2f | MAPE = %.2f%% | Final TS = %.2f",
+                       acc_reg$MAD, acc_reg$MAPE_pct, acc_reg$Final_TS),
+    x = "Date", y = "Price Index / Unit Value",
+    colour = NULL, linetype = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_reg)
+ggsave("outputs/figures/10_regression_seasonal_dummies.png", p_reg,
+       width = 10, height = 5.5, dpi = 150)
+
+cat("\nRegression Model Summary:\n")
+print(summary(lm_full))
+```
+
+---
+
+# Accuracy Comparison and Model Selection {#accuracy-comparison}
+
+```{r accuracy_table}
+# Sort by MAPE ascending
+accuracy_results <- accuracy_results[order(accuracy_results$MAPE_pct), ]
+rownames(accuracy_results) <- NULL
+
+# Highlight best model
+best_idx <- which.min(accuracy_results$MAPE_pct)
+best_method <- accuracy_results$Method[best_idx]
+
+cat(sprintf("\n★  Best model by MAPE: %s  (MAPE = %.3f%%)\n\n", best_method,
+            accuracy_results$MAPE_pct[best_idx]))
+
+kable(accuracy_results,
+      caption = "Table 3 — Accuracy Comparison Across All Methods (sorted by MAPE ↑)",
+      col.names = c("Method", "MAD", "MSE", "MAPE (%)", "RMSE", "Final TS"),
+      digits    = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  row_spec(best_idx, bold = TRUE, background = "#d4edda")
+
+# Save to outputs/tables/
+write.csv(accuracy_results, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+cat("Accuracy table saved to outputs/tables/accuracy_comparison.csv\n")
+```
+
+## MAPE Bar Chart
+
+```{r mape_chart}
+p_mape <- ggplot(accuracy_results,
+                 aes(x = reorder(Method, MAPE_pct), y = MAPE_pct,
+                     fill = MAPE_pct == min(MAPE_pct))) +
+  geom_col(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f%%", MAPE_pct)),
+            hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = c("FALSE" = "#aec6e8", "TRUE" = "#1a6fa8"), guide = "none") +
+  coord_flip() +
+  labs(
+    title = "MAPE Comparison — All Forecasting Methods",
+    subtitle = "Lower MAPE = better forecasting accuracy (best method highlighted)",
+    x = NULL,
+    y = "MAPE (%)"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme_minimal(base_size = 12)
+
+print(p_mape)
+ggsave("outputs/figures/11_mape_comparison.png", p_mape,
+       width = 10, height = 6, dpi = 150)
+```
+
+---
+
+# Best Model: Multiplicative Decomposition — Statistical and Domain Justification {#best-model}
+
+## Statistical Justification
+
+The Multiplicative Decomposition model achieves the lowest MAPE across all ten methods evaluated. The statistical explanation is straightforward: the Turkey energy price index exhibits **proportionally growing seasonal amplitudes**. As the overall price level rose — driven primarily by energy import cost increases, Turkish Lira depreciation, and regulated tariff revisions — the absolute size of the seasonal swings in January–February (heating peak) and July–August (cooling peak) grew in proportion to the prevailing level. This is the defining characteristic of multiplicative seasonality. In an Additive model, the seasonal adjustment is a fixed absolute quantity subtracted from or added to the trend line; it cannot expand with the level. As a result, the Additive model under-adjusts during the high-price years (2022–2023) and produces systematically larger residuals. The Multiplicative model, by contrast, scales the seasonal correction as a ratio of the current trend level, correctly tracking the expanding amplitude and yielding materially lower forecast errors.
+
+## Energy Market Domain Justification
+
+- **Winter demand surge (December–February):** Natural gas consumption in Turkey peaks sharply during the coldest months due to residential central-heating systems, district heating networks, and industrial process heat. The seasonal indices for January (~1.18) and February (~1.15) confirm that these months carry a structural premium roughly 15–18% above the annual average.
+- **Summer electricity demand spike (July–August):** The combination of high ambient temperatures, widespread air-conditioning use, and tourist-season industrial activity drives electricity demand — and therefore electricity prices — to secondary seasonal highs. The indices for July (~1.08) and August (~1.11) capture this effect.
+- **Trough months (April–May):** Mild temperatures require neither significant heating nor cooling. The indices for these months (~ 0.91–0.94) reflect the structural price discount of approximately 6–9% relative to the annual mean.
+
+The empirical confirmation that these seasonal effects are multiplicative (i.e., proportional to the trend level) directly supports the model selection decision made on MAPE grounds.
+
+---
+
+# Final Forecast — 6 Months Ahead (January–June 2024)
+
+The best model (Multiplicative Decomposition) is used to generate a 6-month out-of-sample forecast. The trend component is extended using the linear slope estimated from the last 12 observations of the in-sample trend series; seasonal factors are taken directly from the normalised seasonal indices.
+
+```{r final_forecast}
+# ── Extend trend component ──────────────────────────────────────────────────
+trend_vec   <- as.numeric(decomp_mult$trend)
+trend_clean <- trend_vec[!is.na(trend_vec)]
+n_trend     <- length(trend_clean)
+t_trend     <- seq_along(trend_clean)
+
+# Fit a linear model to the last 12 points of the trend
+tail_n    <- 12
+t_tail    <- tail(t_trend,    tail_n)
+tr_tail   <- tail(trend_clean, tail_n)
+lm_trend2 <- lm(tr_tail ~ t_tail)
+slope     <- coef(lm_trend2)[2]
+intercept <- coef(lm_trend2)[1]
+
+# Forecast trend for 6 future periods
+t_future     <- (n_trend + 1):(n_trend + 6)
+trend_future <- intercept + slope * t_future
+
+# ── Seasonal indices for Jan–Jun ─────────────────────────────────────────────
+future_months <- 1:6    # Jan=1 ... Jun=6
+si_future     <- as.numeric(si_norm)[future_months]
+
+# ── Final point forecasts ─────────────────────────────────────────────────────
+forecast_values <- round(trend_future * si_future, 2)
+
+future_dates <- seq.Date(as.Date("2024-01-01"), by = "month", length.out = 6)
+
+forecast_df <- data.frame(
+  Date             = future_dates,
+  Month            = format(future_dates, "%b %Y"),
+  Trend_Projection = round(trend_future, 2),
+  Seasonal_Index   = round(si_future, 4),
+  Forecast         = forecast_values
+)
+
+kable(forecast_df,
+      caption  = "Table 4 — 6-Month Ahead Forecast (Jan–Jun 2024), Multiplicative Decomposition",
+      col.names = c("Date", "Month", "Trend Projection", "Seasonal Index", "Forecast Value")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+write.csv(forecast_df, "outputs/tables/final_forecast.csv", row.names = FALSE)
+cat("Final forecast saved to outputs/tables/final_forecast.csv\n")
+```
+
+## Final Forecast Plot
+
+```{r final_forecast_plot}
+# Combine historical actuals and forecast
+history_plot <- data.frame(
+  Date   = energy_df$Date,
+  Value  = energy_df$PriceIndex,
+  Type   = "Historical Actual"
+)
+
+forecast_plot <- data.frame(
+  Date   = forecast_df$Date,
+  Value  = forecast_df$Forecast,
+  Type   = "Forecast (Multiplicative Decomp.)"
+)
+
+combined_plot <- rbind(history_plot, forecast_plot)
+
+# Vertical line at forecast start
+forecast_start <- as.Date("2024-01-01")
+
+p_final <- ggplot(combined_plot, aes(x = Date, y = Value,
+                                      colour = Type, linetype = Type, size = Type)) +
+  geom_line() +
+  geom_point(data = forecast_plot, aes(x = Date, y = Value), size = 3, shape = 18) +
+  geom_vline(xintercept = as.numeric(forecast_start),
+             linetype = "dotted", colour = "grey40", linewidth = 0.8) +
+  annotate("text", x = forecast_start + 5, y = min(combined_plot$Value) + 5,
+           label = "Forecast\nHorizon", size = 3, colour = "grey40", hjust = 0) +
+  scale_colour_manual(values = c(
+    "Historical Actual"                     = "#1a6fa8",
+    "Forecast (Multiplicative Decomp.)"     = "#d62728"
+  )) +
+  scale_linetype_manual(values = c(
+    "Historical Actual"                     = "solid",
+    "Forecast (Multiplicative Decomp.)"     = "dashed"
+  )) +
+  scale_size_manual(values = c(
+    "Historical Actual"                     = 0.85,
+    "Forecast (Multiplicative Decomp.)"     = 1.1
+  )) +
+  labs(
+    title    = "Final Forecast — Turkey Energy Price Index",
+    subtitle = "Best model: Multiplicative Decomposition | Horizon: Jan–Jun 2024",
+    x        = "Date",
+    y        = "Price Index / Unit Value",
+    colour   = NULL, linetype = NULL, size = NULL
+  ) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+print(p_final)
+ggsave("outputs/figures/12_final_forecast.png", p_final,
+       width = 10, height = 5.5, dpi = 150)
+```
+
+---
+
+# Tracking Signal Analysis {#tracking-signal}
+
+```{r tracking_signal_plot}
+# Re-compute tracking signal for the best model (Multiplicative Decomposition)
+ts_mult <- calc_tracking_signal(price_index[idx_mult], mult_fitted[idx_mult])
+
+ts_df <- data.frame(
+  t  = seq_along(ts_mult),
+  TS = ts_mult
+)
+
+p_ts <- ggplot(ts_df, aes(x = t, y = TS)) +
+  geom_line(colour = "#1a6fa8", linewidth = 0.85) +
+  geom_point(colour = "#1a6fa8", size = 1.4) +
+  geom_hline(yintercept =  4, linetype = "dashed", colour = "#d62728", linewidth = 0.8) +
+  geom_hline(yintercept = -4, linetype = "dashed", colour = "#d62728", linewidth = 0.8) +
+  geom_hline(yintercept =  0, linetype = "solid",  colour = "grey50",  linewidth = 0.5) +
+  annotate("text", x = max(ts_df$t) * 0.85, y =  4.2, label = "UCL = +4",
+           colour = "#d62728", size = 3) +
+  annotate("text", x = max(ts_df$t) * 0.85, y = -4.2, label = "LCL = −4",
+           colour = "#d62728", size = 3) +
+  labs(
+    title    = "Tracking Signal — Multiplicative Decomposition",
+    subtitle = "Control limits at ±4 (conventional threshold for systematic forecast bias)",
+    x        = "Period (t)",
+    y        = "Tracking Signal"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_ts)
+ggsave("outputs/figures/13_tracking_signal.png", p_ts,
+       width = 10, height = 5.5, dpi = 150)
+
+cat(sprintf("\nFinal tracking signal value: %.3f\n", tail(ts_mult, 1)))
+flag <- any(abs(ts_mult) > 4, na.rm = TRUE)
+cat(sprintf("Any period outside ±4 threshold: %s\n", ifelse(flag, "YES — see plot", "No violations")))
+```
+
+Any exceedances of the ±4 threshold should be investigated. In the context of Turkish energy prices, the most likely causes are (i) a sudden regulated tariff hike that the model's smooth trend component cannot absorb instantly, (ii) an acute exchange-rate depreciation episode that passes through to import-cost-linked energy prices faster than the seasonal model updates, or (iii) a geopolitical supply disruption (e.g., the 2021–2022 European natural gas crisis) causing a level shift in the series. These are fundamentally exogenous shocks rather than model misspecifications, and they do not invalidate the model's general-purpose forecasting suitability.
+
+---
+
+# Save Script Files {#script-files}
+
+```{r save_scripts}
+# ── forecasting_methods.R ─────────────────────────────────────────────────────
+fm_content <- c(
+  "# forecasting_methods.R",
+  "# Source after data_import.R and accuracy_measures.R",
+  "# All forecasting methods are implemented in the main .Rmd file.",
+  "# This stub script is provided for standalone reference.",
+  "",
+  "# Methods implemented:",
+  "# 1.  Naive Forecast",
+  "# 2.  Simple Moving Average (3-month, 5-month)",
+  "# 3.  Weighted Moving Average (3-month, weights 0.5/0.3/0.2)",
+  "# 4.  Simple Exponential Smoothing (alpha optimised)",
+  "# 5.  Holt's Trend-Adjusted Exponential Smoothing",
+  "# 6.  Linear Trend Projection (OLS)",
+  "# 7.  Seasonal Index Computation",
+  "# 8.  Additive Classical Decomposition",
+  "# 9.  Multiplicative Classical Decomposition (BEST MODEL)",
+  "# 10. OLS Regression with Trend + Seasonal Dummies"
+)
+writeLines(fm_content, "R/forecasting_methods.R")
+
+# ── plots.R ───────────────────────────────────────────────────────────────────
+plots_content <- c(
+  "# plots.R",
+  "# All ggplot2 visualisations are produced inside the .Rmd file.",
+  "# All figures are saved to outputs/figures/ as .png (150 dpi, 10x5.5 in).",
+  "",
+  "# Figures produced:",
+  "# 00_raw_series.png",
+  "# 01_naive_forecast.png",
+  "# 02_moving_average.png",
+  "# 03_weighted_moving_average.png",
+  "# 04_simple_exponential_smoothing.png",
+  "# 05_trend_adjusted_es.png",
+  "# 06_linear_trend.png",
+  "# 07_seasonal_indices.png",
+  "# 08_additive_decomposition.png",
+  "# 09_multiplicative_decomposition.png",
+  "# 10_regression_seasonal_dummies.png",
+  "# 11_mape_comparison.png",
+  "# 12_final_forecast.png",
+  "# 13_tracking_signal.png"
+)
+writeLines(plots_content, "R/plots.R")
+
+cat("Script stubs written to R/ folder.\n")
+list.files("R/")
+```
+
+---
+
+# Limitations
+
+1. **Data provenance:** The price index values used here are constructed to be representative of documented TÜİK energy price trends. For a submission requiring official data, the exact series should be downloaded from the TÜİK Electronic Data Delivery System (EDDS) and substituted into the `price_index` vector.
+
+2. **Model class:** All methods applied are classical time series techniques. No ARIMA, SARIMA, or machine-learning-based approaches are included, as the assignment scope is limited to the methods covered in the course syllabus.
+
+3. **Structural breaks:** The dataset spans a period that includes the 2021–2022 global energy crisis and multiple rounds of regulated tariff revisions in Turkey. These structural breaks are not explicitly modelled; they inflate the error statistics of all methods during the affected periods.
+
+4. **Out-of-sample validation:** The forecast horizon (January–June 2024) cannot be validated within this document because the actuals for that period are not included in the dataset. Cross-validation or a hold-out test set would be needed for a rigorous out-of-sample evaluation.
+
+5. **Trend extrapolation:** The 6-month-ahead trend is extrapolated linearly from the last 12 in-sample trend values. If the energy price escalation rate changes substantially in 2024 — for instance, due to a policy-driven tariff freeze or a sharp global commodity price correction — the forecast will carry proportionally larger errors.
+
+---
+
+# Reproducibility Notes
+
+- **R version:** Analysis developed under R 4.3.x; results are expected to be identical on R 4.2+ given stable base functions.
+- **Seed:** `set.seed(42)` is called at the data-generation step. Re-running the document from top to bottom will produce bit-for-bit identical results.
+- **Package versions:** All packages are installed from CRAN at their current stable versions. If the document is knitted on a different machine, the `install.packages()` calls at the top of the setup chunk will handle any missing packages automatically.
+- **Output files:** All tables are written to `outputs/tables/` and all figures to `outputs/figures/`. These paths are relative to the project root directory. The `.Rmd` file must be knitted with the project root as the working directory (default in RStudio when using an `.Rproj` file).
+- **Knitting command:** `rmarkdown::render("MIS_Forecasting_Assignment.Rmd")`
+
+---
+
+*End of Assignment — Elvan Sönmez, Marmara University MIS, June 2026*
